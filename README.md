@@ -96,7 +96,7 @@ Additional changes include DS2413 support, diagnostics, and integration adjustme
 - Improved DS2413 diagnostics (raw status, nibble validation, fallback tracing).
 - Added scan diagnostics with family code and CRC verification.
 - Added practical YAML examples for DS2482 temperature + DS2413 PIO inputs.
-- Repository docs expanded (`AGENTS.md`, updated `README.md`).
+- Repository docs expanded (`README.md`).
 
 ## License
 MIT License.
