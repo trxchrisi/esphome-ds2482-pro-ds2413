@@ -6,6 +6,12 @@ namespace ds2482 {
 
 static const char *TAG = "ds2482.binary_sensor";
 
+static bool is_valid_ds2413_status(uint8_t status) {
+  const uint8_t low_nibble = status & 0x0F;
+  const uint8_t high_nibble = (status >> 4) & 0x0F;
+  return high_nibble == static_cast<uint8_t>((~low_nibble) & 0x0F);
+}
+
 static bool read_ds2413_status(DS2482Component *parent, uint8_t channel, uint64_t address, uint8_t *status) {
   if (!parent->reset_1w(channel)) {
     return false;
@@ -28,37 +34,49 @@ void DS2482BinarySensor::update() {
     return;
   }
 
+  const uint64_t configured_address = this->address_;
+  uint64_t request_address = this->address_locked_ ? this->effective_address_ : configured_address;
   uint8_t status = 0xFF;
-  ESP_LOGD(TAG, "[CH:%d] 0x%016llX: DS2413 read start (PIO=%s, inverted=%s)", this->channel_, this->address_,
-           this->pio_ == 0 ? "A" : "B", this->inverted_ ? "YES" : "NO");
-  if (!read_ds2413_status(this->parent_, this->channel_, this->address_, &status)) {
+  ESP_LOGV(TAG, "[CH:%d] 0x%016llX: DS2413 read start (req=0x%016llX PIO=%s, inverted=%s)", this->channel_, this->address_,
+           request_address, this->pio_ == 0 ? "A" : "B", this->inverted_ ? "YES" : "NO");
+
+  if (this->parent_->get_ds2413_cached_status(this->channel_, request_address, &status)) {
+    ESP_LOGV(TAG, "[CH:%d] 0x%016llX: cache hit status=0x%02X", this->channel_, this->address_, status);
+  } else if (!read_ds2413_status(this->parent_, this->channel_, request_address, &status)) {
     ESP_LOGW(TAG, "[CH:%d] 0x%016llX: no presence pulse", this->channel_, this->address_);
     return;
   }
 
-  // DS2413 returns data in the low nibble, high nibble is inverted low nibble.
-  const uint8_t low_nibble = status & 0x0F;
-  const uint8_t high_nibble = (status >> 4) & 0x0F;
-  bool valid = high_nibble == static_cast<uint8_t>((~low_nibble) & 0x0F);
-  ESP_LOGD(TAG, "[CH:%d] 0x%016llX: primary status=0x%02X low=0x%X high=0x%X valid=%s", this->channel_,
-           this->address_, status, low_nibble, high_nibble, valid ? "YES" : "NO");
+  bool valid = is_valid_ds2413_status(status);
+  ESP_LOGV(TAG, "[CH:%d] 0x%016llX: primary status=0x%02X valid=%s", this->channel_,
+           this->address_, status, valid ? "YES" : "NO");
 
-  if (!valid) {
-    // Fallback: some installations report ROM with bit 7 of byte 0 flipped.
-    // Retry once with that bit toggled before failing hard.
-    const uint64_t alt_address = this->address_ ^ 0x8000000000000000ULL;
-    ESP_LOGD(TAG, "[CH:%d] 0x%016llX: trying fallback address 0x%016llX", this->channel_, this->address_, alt_address);
+  // Retry once on the same ROM to handle transient line noise.
+  if (!valid && !read_ds2413_status(this->parent_, this->channel_, request_address, &status)) {
+    ESP_LOGW(TAG, "[CH:%d] 0x%016llX: retry no presence pulse", this->channel_, this->address_);
+    return;
+  } else if (!valid) {
+    valid = is_valid_ds2413_status(status);
+    ESP_LOGV(TAG, "[CH:%d] 0x%016llX: retry status=0x%02X valid=%s", this->channel_, this->address_, status,
+             valid ? "YES" : "NO");
+  }
+
+  if (!valid && !this->address_locked_) {
+    // Fallback for installations where scan/config differs by bit 7 in ROM byte 0.
+    const uint64_t alt_address = configured_address ^ 0x8000000000000000ULL;
+    ESP_LOGV(TAG, "[CH:%d] 0x%016llX: trying fallback address 0x%016llX", this->channel_, this->address_, alt_address);
     if (read_ds2413_status(this->parent_, this->channel_, alt_address, &status)) {
-      const uint8_t alt_low_nibble = status & 0x0F;
-      const uint8_t alt_high_nibble = (status >> 4) & 0x0F;
-      valid = alt_high_nibble == static_cast<uint8_t>((~alt_low_nibble) & 0x0F);
-      ESP_LOGD(TAG, "[CH:%d] 0x%016llX: fallback status=0x%02X low=0x%X high=0x%X valid=%s", this->channel_,
-               this->address_, status, alt_low_nibble, alt_high_nibble, valid ? "YES" : "NO");
+      valid = is_valid_ds2413_status(status);
+      ESP_LOGV(TAG, "[CH:%d] 0x%016llX: fallback status=0x%02X valid=%s", this->channel_,
+               this->address_, status, valid ? "YES" : "NO");
       if (valid) {
-        ESP_LOGW(TAG, "[CH:%d] 0x%016llX: address fallback active, check scanned ROM", this->channel_, this->address_);
+        this->effective_address_ = alt_address;
+        this->address_locked_ = true;
+        request_address = alt_address;
+        ESP_LOGW(TAG, "[CH:%d] 0x%016llX: using fallback ROM 0x%016llX", this->channel_, this->address_, alt_address);
       }
     } else {
-      ESP_LOGD(TAG, "[CH:%d] 0x%016llX: fallback address had no presence pulse", this->channel_, this->address_);
+      ESP_LOGV(TAG, "[CH:%d] 0x%016llX: fallback address had no presence pulse", this->channel_, this->address_);
     }
   }
 
@@ -68,13 +86,15 @@ void DS2482BinarySensor::update() {
     return;
   }
 
+  this->parent_->put_ds2413_cached_status(this->channel_, request_address, status);
+
   // Bit 0 = sensed level PIOA, Bit 1 = sensed level PIOB
   const bool raw_state = ((status >> this->pio_) & 0x01) != 0;
   bool state = raw_state;
   if (this->inverted_) {
     state = !state;
   }
-  ESP_LOGD(TAG, "[CH:%d] 0x%016llX: publish state raw=%s final=%s", this->channel_, this->address_,
+  ESP_LOGV(TAG, "[CH:%d] 0x%016llX: publish state raw=%s final=%s", this->channel_, this->address_,
            raw_state ? "ON" : "OFF", state ? "ON" : "OFF");
   this->publish_state(state);
 }
@@ -83,6 +103,7 @@ void DS2482BinarySensor::dump_config() {
   LOG_BINARY_SENSOR("", "DS2482 DS2413 Binary Sensor", this);
   ESP_LOGCONFIG(TAG, "  1-Wire Channel: %u", this->channel_);
   ESP_LOGCONFIG(TAG, "  Address: 0x%016llX", this->address_);
+  ESP_LOGCONFIG(TAG, "  Fallback ROM lock: %s", this->address_locked_ ? "ACTIVE" : "OFF");
   ESP_LOGCONFIG(TAG, "  PIO: %s", this->pio_ == 0 ? "A" : "B");
   ESP_LOGCONFIG(TAG, "  Inverted: %s", this->inverted_ ? "YES" : "NO");
 }

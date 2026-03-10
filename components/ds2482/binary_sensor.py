@@ -24,7 +24,7 @@ CONFIG_SCHEMA = binary_sensor.binary_sensor_schema(DS2482BinarySensor).extend(
         cv.Optional(CONF_PIO, default="A"): cv.enum(PIO_OPTIONS, upper=True),
         cv.Optional(CONF_INVERTED, default=False): cv.boolean,
     }
-).extend(cv.polling_component_schema("5s"))
+).extend(cv.polling_component_schema("1s"))
 
 
 async def to_code(config):

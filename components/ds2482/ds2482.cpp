@@ -20,6 +20,7 @@ void DS2482Component::setup() {
   this->is_ds2482_800_ = (this->write(test_ch, 2) == i2c::ERROR_OK);
   
   this->configure_masters(true, false, false);
+  this->invalidate_ds2413_cache();
 }
 
 bool DS2482Component::configure_masters(bool active_pullup, bool overdrive, bool strong_pullup) {
@@ -44,6 +45,8 @@ bool DS2482Component::configure_masters(bool active_pullup, bool overdrive, bool
 bool DS2482Component::select_channel(uint8_t channel) {
   static const uint8_t ch_codes[] = {0xF0, 0xE1, 0xD2, 0xC3, 0xB4, 0xA5, 0x96, 0x87};
   if (channel > 7) return false;
+  if (!this->is_ds2482_800_) channel = 0;
+  if (this->active_channel_ == channel) return true;
 
   uint8_t cmd[2] = {0xC3, ch_codes[channel]};
   if (this->write(cmd, 2) != i2c::ERROR_OK) return false;
@@ -54,6 +57,36 @@ bool DS2482Component::select_channel(uint8_t channel) {
   this->active_channel_ = channel;
   this->configure_masters(true, false, false); 
   return true;
+}
+
+bool DS2482Component::get_ds2413_cached_status(uint8_t channel, uint64_t address, uint8_t *status, uint32_t max_age_ms) {
+  const uint32_t now = millis();
+  for (uint8_t i = 0; i < DS2413_CACHE_SIZE; i++) {
+    auto &entry = this->ds2413_cache_[i];
+    if (!entry.valid) continue;
+    if (entry.channel != channel || entry.address != address) continue;
+    if (now - entry.updated_ms > max_age_ms) continue;
+    *status = entry.status;
+    return true;
+  }
+  return false;
+}
+
+void DS2482Component::put_ds2413_cached_status(uint8_t channel, uint64_t address, uint8_t status) {
+  auto &entry = this->ds2413_cache_[this->ds2413_cache_next_];
+  entry.valid = true;
+  entry.channel = channel;
+  entry.address = address;
+  entry.status = status;
+  entry.updated_ms = millis();
+  this->ds2413_cache_next_ = (this->ds2413_cache_next_ + 1) % DS2413_CACHE_SIZE;
+}
+
+void DS2482Component::invalidate_ds2413_cache() {
+  for (uint8_t i = 0; i < DS2413_CACHE_SIZE; i++) {
+    this->ds2413_cache_[i].valid = false;
+  }
+  this->ds2413_cache_next_ = 0;
 }
 
 bool DS2482Component::reset_1w(uint8_t channel) {
@@ -221,6 +254,7 @@ void DS2482Component::recover_bus() {
     this->write(&cmd, 1);
     delay(20);
     this->configure_masters(true, false, false);
+    this->invalidate_ds2413_cache();
 }
 
 } 
